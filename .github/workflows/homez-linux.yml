@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
+      packages: write
 
     steps:
       # Step 1: Log in to GitHub Container Registry
@@ -71,3 +71,12 @@ jobs:
             echo "Tunnel dropped, reconnecting in 10s..."
             sleep 10
           done
+
+      # Step 9: Commit the container, tag latest, and push to GHCR
+      - name: Commit and push container
+        if: always()
+        continue-on-error: true
+        run: |
+          docker commit homez homez:latest
+          docker tag homez:latest ghcr.io/codednexsus/homez:latest
+          docker push ghcr.io/codednexsus/homez:latest
