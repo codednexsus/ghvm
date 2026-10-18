@@ -1,0 +1,73 @@
+name: homez-linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-homez:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      # Step 1: Log in to GitHub Container Registry
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 2: Pull the homez image
+      - name: Pull homez image
+        run: docker pull ghcr.io/codednexsus/homez:latest
+
+      # Step 3: Remove any existing container with the same name
+      - name: Clean up existing container
+        run: docker rm -f homez || true
+
+      # Step 4: Create and start the container (same name) with port mapping
+      - name: Run homez container
+        run: |
+          docker run -d \
+            --name homez \
+            -p 4500:4500 \
+            ghcr.io/codednexsus/homez:latest
+
+      # Step 5: Start the SSH service inside the container on port 4500
+      - name: Start sshd inside container
+        run: |
+          docker exec homez bash -c "mkdir -p /run/sshd; /usr/sbin/sshd -p 4500; echo 'sshd started on port 4500'"
+
+      # Step 6: Verify the container and port mapping
+      - name: Verify container
+        run: |
+          docker ps -a --filter "name=homez"
+          docker port homez
+          docker exec homez bash -c "git --version && curl --version | head -1"
+
+      # Step 7: Register the Serveo SSH key (private key stored as a secret)
+      - name: Set up Serveo SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVEO_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ls -l ~/.ssh/id_ed25519
+
+      # Step 8: Expose the container over Serveo (homez.serveousercontent.com -> localhost:4500)
+      - name: Start Serveo tunnel
+        timeout-minutes: 350
+        continue-on-error: true
+        run: |
+          while true; do
+            ssh -p 443 \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o ServerAliveInterval=30 \
+                -o ServerAliveCountMax=3 \
+                -R homez.serveousercontent.com:80:localhost:4500 \
+                serveo.net || true
+            echo "Tunnel dropped, reconnecting in 10s..."
+            sleep 10
+          done
