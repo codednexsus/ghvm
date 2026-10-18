@@ -56,18 +56,19 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ls -l ~/.ssh/id_ed25519
 
-      # Step 8: Expose the container over Serveo (TCP tunnel for SSH -> localhost:4500)
+      # Step 8: Expose the container over Serveo (TCP alias "homez" -> localhost:4500, SSH jump host)
       - name: Start Serveo tunnel
         timeout-minutes: 350
         continue-on-error: true
         run: |
           while true; do
-            ssh -p 443 \
+            ssh -p 443 -NT \
+                -o ExitOnForwardFailure=yes \
                 -o StrictHostKeyChecking=no \
                 -o UserKnownHostsFile=/dev/null \
                 -o ServerAliveInterval=30 \
                 -o ServerAliveCountMax=3 \
-                -R 0:localhost:4500 \
+                -R homez:22:localhost:4500 \
                 serveo.net || true
             echo "Tunnel dropped, reconnecting in 10s..."
             sleep 10
