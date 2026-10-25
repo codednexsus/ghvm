@@ -21,6 +21,52 @@ jobs:
           net localgroup Administrators Rohit /add
           net user Rohit /active:yes
 
+      # Create a single machine-wide root. Keep ALL tooling here so we never
+      # create the C:\Users\Rohit stub that used to hijack profile resolution.
+      - name: Prepare ghvm root and secrets file
+        shell: pwsh
+        env:
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_REGION: ${{ secrets.S3_REGION }}
+          S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\ProgramData\ghvm'
+          foreach ($d in @($root, (Join-Path $root 'bin'), (Join-Path $root 'state'), (Join-Path $root 'npm'), (Join-Path $root 'bun'))) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+          }
+
+          function ConvertTo-EnvLiteral([string]$Value) {
+            if ($null -eq $Value) { $Value = '' }
+            return "'" + $Value.Replace("'", "''") + "'"
+          }
+          $lines = @(
+            ('$S3Endpoint = ' + (ConvertTo-EnvLiteral $env:S3_ENDPOINT))
+            ('$S3Bucket = ' + (ConvertTo-EnvLiteral $env:S3_BUCKET))
+            ('$S3Region = ' + (ConvertTo-EnvLiteral $env:S3_REGION))
+            ('$S3AccessKeyId = ' + (ConvertTo-EnvLiteral $env:S3_ACCESS_KEY_ID))
+            ('$S3SecretAccessKey = ' + (ConvertTo-EnvLiteral $env:S3_SECRET_ACCESS_KEY))
+          )
+          Set-Content -Path (Join-Path $root 'ghvm.env.ps1') -Value $lines -Encoding utf8
+
+          $binDir = Join-Path $root 'bin'
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($machinePath -notlike "*$binDir*") {
+            [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $binDir), 'Machine')
+          }
+
+          icacls $root /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+          # Tool dirs must be readable/executable by regular (non-elevated) users,
+          # while secrets, state and logs stay restricted to SYSTEM/Administrators.
+          foreach ($shared in @('bin', 'npm', 'bun')) {
+            icacls (Join-Path $root $shared) /inheritance:r `
+              /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" | Out-Null
+          }
+          icacls (Join-Path $root 'ghvm.env.ps1') /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+          Write-Output "Prepared $root"
+
       # Install VS Code (system-wide so all users can use it)
       - name: Install VS Code
         shell: pwsh
@@ -34,12 +80,16 @@ jobs:
       # Save Codeberg private SSH key system-wide so any user can use it
       - name: Save Codeberg SSH key (system-wide)
         shell: pwsh
-        continue-on-error: true
         run: |
+          $ErrorActionPreference = 'Stop'
           $sshDir = "C:\ProgramData\ssh"
           New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
           $keyPath = Join-Path $sshDir "id_ed25519"
           $key = "${{ secrets.CODEBERG_PRIVATE_SSHKEY }}"
+          if ([string]::IsNullOrWhiteSpace($key)) {
+            Write-Output "CODEBERG_PRIVATE_SSHKEY not set, skipping"
+            exit 0
+          }
           [IO.File]::WriteAllText($keyPath, $key.Replace("`r`n", "`n").TrimEnd("`n") + "`n")
 
           $configPath = Join-Path $sshDir "ssh_config"
@@ -56,134 +106,184 @@ jobs:
           icacls $keyPath /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
           Write-Output "Saved SSH key to $keyPath"
 
-      # Configure Git identity system-wide (same as --global for every user)
+      # Configure Git identity system-wide
       - name: Configure Git identity
         shell: pwsh
-        continue-on-error: true
         run: |
+          $ErrorActionPreference = 'Stop'
           $userName = "${{ secrets.CODEBERG_USERNAME }}"
           $userEmail = "${{ secrets.CODEBERG_EMAIL }}"
-          git config --system user.name "$userName"
-          git config --system user.email "$userEmail"
+          if (-not [string]::IsNullOrWhiteSpace($userName)) { git config --system user.name "$userName" }
+          if (-not [string]::IsNullOrWhiteSpace($userEmail)) { git config --system user.email "$userEmail" }
           git config --system --list | Select-String "user\."
-          Write-Output "Git identity set to $userName <$userEmail>"
+          Write-Output "Git identity configured"
 
-      # Install s5cmd (fast parallel S3 client) system-wide
+      # Install s5cmd (fast parallel S3 client) into the ghvm bin dir
       - name: Install s5cmd
         shell: pwsh
-        continue-on-error: true
         run: |
-          $dir = "C:\ProgramData\s5cmd"
+          $ErrorActionPreference = 'Stop'
+          $dir = 'C:\ProgramData\ghvm\bin'
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           $zip = Join-Path $env:RUNNER_TEMP "s5cmd.zip"
           $url = "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Windows-64bit.zip"
           Invoke-WebRequest -Uri $url -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $dir -Force
-          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if ($machinePath -notlike "*$dir*") {
-            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$dir", "Machine")
-          }
           & "$dir\s5cmd.exe" version
+          Write-Output "Installed s5cmd to $dir"
 
-      # Register a Windows Scheduled Task that watches the Data folder and syncs changes to S3 within seconds
+      # Register a scheduled task that mirrors the user's Desktop\Data to S3.
+      # The task resolves the *real* profile via ProfileList/NTUSER.DAT instead
+      # of guessing from a directory name, which is what broke the old version.
       - name: Register S3 watcher scheduled task
         shell: pwsh
-        continue-on-error: true
         run: |
-          $taskDir = "C:\ProgramData\ghvm"
-          New-Item -ItemType Directory -Force -Path $taskDir | Out-Null
-          $scriptPath = Join-Path $taskDir "sync-data.ps1"
-          $scriptLines = @(
-              '$ErrorActionPreference = "Continue"'
-              '$log = "C:\ProgramData\ghvm\sync.log"'
-              '$s5cmd = "C:\ProgramData\s5cmd\s5cmd.exe"'
-              '$endpoint = "${{ secrets.S3_ENDPOINT }}"'
-              '$bucket = "${{ secrets.S3_BUCKET }}"'
-              '$env:AWS_ACCESS_KEY_ID = "${{ secrets.S3_ACCESS_KEY_ID }}"'
-              '$env:AWS_SECRET_ACCESS_KEY = "${{ secrets.S3_SECRET_ACCESS_KEY }}"'
-              '$env:AWS_REGION = "${{ secrets.S3_REGION }}"'
-              '$env:AWS_DEFAULT_REGION = "${{ secrets.S3_REGION }}"'
-              '$src = $null'
-              '$marker = $null'
-              '$watcher = $null'
-              'function Resolve-Profile {'
-              '    $sid = (Get-LocalUser -Name "Rohit" -ErrorAction SilentlyContinue).SID.Value'
-              '    $p = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $sid -and $_.SID -eq $sid } | Sort-Object LastUseTime -Descending | Select-Object -First 1).LocalPath'
-              '    if (-not $p) { $p = (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Rohit*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName }'
-              '    return $p'
-              '}'
-              'function Do-Sync {'
-              '    if (-not $src) { return }'
-              '    if (-not (Test-Path -LiteralPath $src)) { return }'
-              '    $localCount = @(Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch ''[\\/]node_modules[\\/]'' }).Count'
-              '    if ($localCount -eq 0) {'
-              '        $remote = & $s5cmd --endpoint-url $endpoint ls "s3://$bucket/Data/" 2>$null'
-              '        if ($remote) {'
-              '            Add-Content -Path $log -Value ("{0} skip sync: local folder empty, remote has data" -f (Get-Date -Format o))'
-              '            return'
-              '        }'
-              '    }'
-              '    & $s5cmd --endpoint-url $endpoint --numworkers 64 sync --delete --exclude "*/node_modules/*" "$src\" "s3://$bucket/Data/" *>> $log'
-              '}'
-              'function Initialize-Restore {'
-              '    if (-not (Test-Path -LiteralPath $src)) { New-Item -ItemType Directory -Force -Path $src | Out-Null }'
-              '    if (-not (Test-Path -LiteralPath $marker)) {'
-              '        $remote = & $s5cmd --endpoint-url $endpoint ls "s3://$bucket/Data/" 2>$null'
-              '        if ($remote) {'
-              '            & $s5cmd --endpoint-url $endpoint --numworkers 64 sync --exclude "*/node_modules/*" "s3://$bucket/Data/*" "$src\" *>> $log'
-              '            if ($LASTEXITCODE -ne 0) { return $false }'
-              '        }'
-              '        New-Item -ItemType File -Force -Path $marker | Out-Null'
-              '    }'
-              '    return $true'
-              '}'
-              '$lastSync = Get-Date'
-              '$lastEvent = Get-Date'
-              '$pending = $false'
-              'while ($true) {'
-              '    if (-not $src) {'
-              '        $profile = Resolve-Profile'
-              '        if (-not $profile) { Start-Sleep -Seconds 10; continue }'
-              '        $src = Join-Path $profile "Desktop\Data"'
-              '        $marker = Join-Path $profile ".ghvm_restored"'
-              '        if (-not (Initialize-Restore)) { Start-Sleep -Seconds 30; continue }'
-              '        Do-Sync'
-              '        $lastSync = Get-Date'
-              '        try {'
-              '            if ($watcher) { $watcher.Dispose() }'
-              '            $watcher = New-Object IO.FileSystemWatcher $src, "*"'
-              '            $watcher.IncludeSubdirectories = $true'
-              '            $watcher.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::DirectoryName -bor [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size'
-              '            $watcher.EnableRaisingEvents = $true'
-              '        } catch { $watcher = $null }'
-              '    }'
-              '    $changed = $false'
-              '    if ($watcher) {'
-              '        try {'
-              '            $r = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, 1000)'
-              '            if (-not $r.TimedOut) { $changed = $true }'
-              '        } catch { $watcher.Dispose(); $watcher = $null; $changed = $true }'
-              '    } else { Start-Sleep -Milliseconds 1000 }'
-              '    if ($changed) { $pending = $true; $lastEvent = Get-Date }'
-              '    if ($pending -and ((Get-Date) - $lastEvent).TotalSeconds -ge 5) {'
-              '        Do-Sync'
-              '        $pending = $false'
-              '        $lastSync = Get-Date'
-              '    }'
-              '    if (((Get-Date) - $lastSync).TotalMinutes -ge 5) {'
-              '        Do-Sync'
-              '        $lastSync = Get-Date'
-              '        $pending = $false'
-              '    }'
-              '    if ($src -and -not (Test-Path -LiteralPath $src)) {'
-              '        if ($watcher) { $watcher.Dispose(); $watcher = $null }'
-              '        if ($marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }'
-              '        $src = $null'
-              '    }'
-              '}'
-          )
-          Set-Content -Path $scriptPath -Value $scriptLines -Encoding ascii
-          icacls $taskDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+          $ErrorActionPreference = 'Stop'
+          $root = 'C:\ProgramData\ghvm'
+          $scriptPath = Join-Path $root 'sync-data.ps1'
+
+          $script = @'
+          $ErrorActionPreference = 'Continue'
+
+          $Root = 'C:\ProgramData\ghvm'
+          $Log = Join-Path $Root 'sync.log'
+          $S5 = Join-Path $Root 'bin\s5cmd.exe'
+          $StateDir = Join-Path $Root 'state'
+          $WatchUser = 'Rohit'
+
+          . (Join-Path $Root 'ghvm.env.ps1')
+
+          $env:AWS_ACCESS_KEY_ID = $S3AccessKeyId
+          $env:AWS_SECRET_ACCESS_KEY = $S3SecretAccessKey
+          $env:AWS_REGION = $S3Region
+          $env:AWS_DEFAULT_REGION = $S3Region
+
+          New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+
+          function Write-Log([string]$Message) {
+              Add-Content -Path $Log -Value ('{0} {1}' -f (Get-Date -Format o), $Message) -ErrorAction SilentlyContinue
+          }
+
+          # Resolve the real profile for the watched user. A profile is only
+          # considered valid when NTUSER.DAT exists, so empty stub dirs are never picked.
+          function Get-WatchProfile {
+              $user = Get-LocalUser -Name $WatchUser -ErrorAction SilentlyContinue
+              if (-not $user) { return $null }
+              $sid = $user.SID.Value
+              $reg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $sid
+              $path = (Get-ItemProperty -Path $reg -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
+              if ($path) {
+                  $path = [Environment]::ExpandEnvironmentVariables($path)
+                  if (Test-Path -LiteralPath (Join-Path $path 'NTUSER.DAT')) { return $path }
+              }
+              $cim = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+                  Where-Object { $_.SID -eq $sid } | Select-Object -First 1
+              if ($cim -and $cim.LocalPath -and (Test-Path -LiteralPath (Join-Path $cim.LocalPath 'NTUSER.DAT'))) {
+                  return $cim.LocalPath
+              }
+              return $null
+          }
+
+          function Restore-Data([string]$Target) {
+              New-Item -ItemType Directory -Force -Path $Target | Out-Null
+              Write-Log 'restore: syncing from S3'
+              & $S5 --endpoint-url $S3Endpoint --numworkers 64 sync --exclude "*/node_modules/*" "s3://$S3Bucket/Data/" $Target *>> $Log
+              if ($LASTEXITCODE -ne 0) { Write-Log "restore: failed ($LASTEXITCODE)"; return $false }
+              Write-Log 'restore: complete'
+              return $true
+          }
+
+          # Never run --delete from an empty local folder. This makes a wiped or
+          # temporarily unavailable profile filesystem unable to erase the backup.
+          function Sync-Data([string]$Source) {
+              if (-not $Source -or -not (Test-Path -LiteralPath $Source)) { return }
+              $localCount = @(Get-ChildItem -LiteralPath $Source -Recurse -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }).Count
+              if ($localCount -eq 0) {
+                  Write-Log 'sync: skipped (local folder empty)'
+                  return
+              }
+              & $S5 --endpoint-url $S3Endpoint --numworkers 64 sync --delete --exclude "*/node_modules/*" ($Source.TrimEnd('\') + '\') "s3://$S3Bucket/Data/" *>> $Log
+              if ($LASTEXITCODE -ne 0) { Write-Log "sync: failed ($LASTEXITCODE)" }
+          }
+
+          $src = $null
+          $marker = $null
+          $watcher = $null
+          $lastSync = Get-Date
+          $lastEvent = Get-Date
+          $pending = $false
+
+          Write-Log 'watcher: started'
+
+          while ($true) {
+              if (-not $src) {
+                  $profile = Get-WatchProfile
+                  if (-not $profile) { Start-Sleep -Seconds 10; continue }
+                  $sid = (Get-LocalUser -Name $WatchUser).SID.Value
+                  $src = Join-Path $profile 'Desktop\Data'
+                  $marker = Join-Path $StateDir ($sid + '.restored')
+                  New-Item -ItemType Directory -Force -Path $src | Out-Null
+                  Write-Log ("watcher: profile=" + $profile)
+                  if (-not (Test-Path -LiteralPath $marker)) {
+                      if (Restore-Data $src) {
+                          New-Item -ItemType File -Force -Path $marker | Out-Null
+                      } else {
+                          Start-Sleep -Seconds 30
+                          $src = $null
+                          $marker = $null
+                          continue
+                      }
+                  }
+                  Sync-Data $src
+                  $lastSync = Get-Date
+                  try {
+                      if ($watcher) { $watcher.Dispose() }
+                      $watcher = New-Object IO.FileSystemWatcher $src, '*'
+                      $watcher.IncludeSubdirectories = $true
+                      $watcher.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::DirectoryName -bor [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size
+                      $watcher.EnableRaisingEvents = $true
+                  } catch {
+                      $watcher = $null
+                      Write-Log ("watcher: error " + $_.Exception.Message)
+                  }
+              }
+
+              $changed = $false
+              if ($watcher) {
+                  try {
+                      $r = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, 1000)
+                      if (-not $r.TimedOut) { $changed = $true }
+                  } catch {
+                      $watcher.Dispose()
+                      $watcher = $null
+                      $changed = $true
+                  }
+              } else {
+                  Start-Sleep -Milliseconds 1000
+              }
+
+              if ($changed) { $pending = $true; $lastEvent = Get-Date }
+              if ($pending -and ((Get-Date) - $lastEvent).TotalSeconds -ge 5) {
+                  Sync-Data $src
+                  $pending = $false
+                  $lastSync = Get-Date
+              }
+              if (((Get-Date) - $lastSync).TotalMinutes -ge 5) {
+                  Sync-Data $src
+                  $lastSync = Get-Date
+                  $pending = $false
+              }
+              if ($src -and -not (Test-Path -LiteralPath $src)) {
+                  if ($watcher) { $watcher.Dispose(); $watcher = $null }
+                  if ($marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }
+                  $src = $null
+                  $marker = $null
+              }
+          }
+          '@
+
+          Set-Content -Path $scriptPath -Value $script -Encoding utf8
           icacls $scriptPath /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
 
           $pwsh = "$env:ProgramFiles\PowerShell\7\pwsh.exe"
@@ -198,7 +298,9 @@ jobs:
           Register-ScheduledTask -TaskName "GhvmS3Sync" -Action $action -Trigger $trigger `
               -Principal $principal -Settings $settings -Force | Out-Null
           Start-ScheduledTask -TaskName "GhvmS3Sync"
-          Write-Output "Registered and started scheduled task GhvmS3Sync"
+          Start-Sleep -Seconds 5
+          $info = Get-ScheduledTaskInfo -TaskName "GhvmS3Sync"
+          Write-Output "GhvmS3Sync state=$((Get-ScheduledTask -TaskName 'GhvmS3Sync').State) lastResult=$($info.LastTaskResult)"
 
       # Step 3: Download Pinggy CLI
       - name: Download Pinggy CLI
@@ -210,31 +312,33 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $output
           Write-Output "Downloaded pinggy.exe to $output"
 
-      # Install opencode-ai (synchronous, available for all users)
+      # Install opencode-ai into a shared prefix (NOT the user profile)
       - name: Install opencode-ai
         shell: pwsh
         continue-on-error: true
         run: |
-          $rohitDir = "C:\Users\Rohit\AppData\Roaming\npm"
-          New-Item -ItemType Directory -Force -Path $rohitDir
-          npm config set prefix $rohitDir
+          $prefix = 'C:\ProgramData\ghvm\npm'
+          New-Item -ItemType Directory -Force -Path $prefix | Out-Null
+          $env:NPM_CONFIG_PREFIX = $prefix
+          npm config set prefix $prefix --global
           npm install -g opencode-ai
-          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-          if ($machinePath -notlike "*$rohitDir*") {
-            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$rohitDir", "Machine")
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($machinePath -notlike "*$prefix*") {
+            [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $prefix), 'Machine')
           }
 
-      # Install Bun (synchronous, available for all users)
+      # Install Bun into a shared prefix (NOT the user profile)
       - name: Install Bun
         shell: pwsh
         continue-on-error: true
         run: |
-          $env:BUN_INSTALL = "C:\Users\Rohit\.bun"
+          $bunRoot = 'C:\ProgramData\ghvm\bun'
+          $env:BUN_INSTALL = $bunRoot
           irm bun.sh/install.ps1 | iex
-          $bunDir = "C:\Users\Rohit\.bun\bin"
-          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          $bunDir = Join-Path $bunRoot 'bin'
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           if ($machinePath -notlike "*$bunDir*") {
-            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$bunDir", "Machine")
+            [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $bunDir), 'Machine')
           }
 
       # Step 4: Run reverse tunnel with Pinggy (timeout 5h 45m)
@@ -253,36 +357,59 @@ jobs:
               Start-Sleep -Seconds 10
           }
 
-      # Upload Data folder to S3-compatible storage (iDrive e2) with s5cmd
+      # Stop the watcher and do a final, verified upload
       - name: Upload Data to S3
         shell: pwsh
         continue-on-error: true
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.S3_REGION }}
-          AWS_DEFAULT_REGION: ${{ secrets.S3_REGION }}
         run: |
-          $sid = (Get-LocalUser -Name "Rohit" -ErrorAction SilentlyContinue).SID.Value
-          $profile = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $sid -and $_.SID -eq $sid } | Sort-Object LastUseTime -Descending | Select-Object -First 1).LocalPath
-          if (-not $profile) {
-            $profile = (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Rohit*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+          $root = 'C:\ProgramData\ghvm'
+          $log = Join-Path $root 'sync.log'
+          function Write-Log([string]$Message) {
+            Add-Content -Path $log -Value ('{0} {1}' -f (Get-Date -Format o), $Message) -ErrorAction SilentlyContinue
+            Write-Output $Message
           }
-          if (-not $profile) {
-            Write-Output "Could not resolve Rohit profile, skipping upload"
-            exit 0
+          . (Join-Path $root 'ghvm.env.ps1')
+          $env:AWS_ACCESS_KEY_ID = $S3AccessKeyId
+          $env:AWS_SECRET_ACCESS_KEY = $S3SecretAccessKey
+          $env:AWS_REGION = $S3Region
+          $env:AWS_DEFAULT_REGION = $S3Region
+          $s5 = Join-Path $root 'bin\s5cmd.exe'
+
+          function Get-WatchProfile {
+              $user = Get-LocalUser -Name 'Rohit' -ErrorAction SilentlyContinue
+              if (-not $user) { return $null }
+              $sid = $user.SID.Value
+              $reg = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $sid
+              $path = (Get-ItemProperty -Path $reg -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
+              if ($path) {
+                  $path = [Environment]::ExpandEnvironmentVariables($path)
+                  if (Test-Path -LiteralPath (Join-Path $path 'NTUSER.DAT')) { return $path }
+              }
+              $cim = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+                  Where-Object { $_.SID -eq $sid } | Select-Object -First 1
+              if ($cim -and $cim.LocalPath -and (Test-Path -LiteralPath (Join-Path $cim.LocalPath 'NTUSER.DAT'))) { return $cim.LocalPath }
+              return $null
           }
-          $src = Join-Path $profile "Desktop\Data"
-          if (-not (Test-Path -LiteralPath $src)) {
-            Write-Output "No Data folder at $src, skipping upload"
-            exit 0
-          }
+
+          $profile = Get-WatchProfile
+          if (-not $profile) { Write-Log 'final: no profile resolved, skipping upload'; exit 0 }
+          $src = Join-Path $profile 'Desktop\Data'
+          if (-not (Test-Path -LiteralPath $src)) { Write-Log "final: no Data folder at $src, skipping"; exit 0 }
+
           Stop-ScheduledTask -TaskName "GhvmS3Sync" -ErrorAction SilentlyContinue
           Unregister-ScheduledTask -TaskName "GhvmS3Sync" -Confirm:$false -ErrorAction SilentlyContinue
-          $s5cmd = "C:\ProgramData\s5cmd\s5cmd.exe"
-          & $s5cmd --endpoint-url "${{ secrets.S3_ENDPOINT }}" --numworkers 64 `
-              sync --delete --exclude "*/node_modules/*" "$src\" "s3://${{ secrets.S3_BUCKET }}/Data/"
-          if ($LASTEXITCODE -ne 0) {
-            throw "s5cmd upload failed with exit code $LASTEXITCODE"
+          for ($i = 0; $i -lt 30; $i++) {
+              if (-not (Get-Process s5cmd -ErrorAction SilentlyContinue)) { break }
+              Start-Sleep -Seconds 2
           }
-          Write-Output "Uploaded $src to s3://${{ secrets.S3_BUCKET }}/Data/"
+
+          $localCount = @(Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' }).Count
+          if ($localCount -eq 0) {
+              Write-Log 'final: local folder empty, skipping upload'
+              exit 0
+          }
+
+          & $s5 --endpoint-url $S3Endpoint --numworkers 64 sync --delete --exclude "*/node_modules/*" ($src.TrimEnd('\') + '\') "s3://$S3Bucket/Data/"
+          if ($LASTEXITCODE -ne 0) { Write-Log "final: upload failed ($LASTEXITCODE)"; exit 1 }
+          Write-Log "final: uploaded $src to s3://$S3Bucket/Data/"
