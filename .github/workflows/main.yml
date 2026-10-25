@@ -359,6 +359,7 @@ jobs:
 
       # Stop the watcher and do a final, verified upload
       - name: Upload Data to S3
+        if: ${{ always() }}
         shell: pwsh
         continue-on-error: true
         run: |
