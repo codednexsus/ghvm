@@ -31,15 +31,174 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $output
           Start-Process -FilePath $output -Args "/silent /mergetasks=!runcode" -Wait
 
-      # Step 2: Restore Data folder cache
-      - name: Restore Data folder cache
-        uses: actions/cache@v4
+      # Save Codeberg private SSH key system-wide so any user can use it
+      - name: Save Codeberg SSH key (system-wide)
+        shell: pwsh
         continue-on-error: true
-        with:
-          path: C:\Users\Rohit\Desktop\Data
-          key: ${{ runner.os }}-runner-desktop-data-${{ github.run_number }}
-          restore-keys: |
-            ${{ runner.os }}-runner-desktop-data-
+        run: |
+          $sshDir = "C:\ProgramData\ssh"
+          New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+          $keyPath = Join-Path $sshDir "id_ed25519"
+          $key = "${{ secrets.CODEBERG_PRIVATE_SSHKEY }}"
+          [IO.File]::WriteAllText($keyPath, $key.Replace("`r`n", "`n").TrimEnd("`n") + "`n")
+
+          $configPath = Join-Path $sshDir "ssh_config"
+          $configLines = @(
+              "Host codeberg.org"
+              "    HostName codeberg.org"
+              "    User git"
+              "    IdentityFile $keyPath"
+              "    IdentitiesOnly yes"
+          )
+          Set-Content -Path $configPath -Value $configLines -Encoding ascii
+
+          icacls $sshDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" | Out-Null
+          icacls $keyPath /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+          Write-Output "Saved SSH key to $keyPath"
+
+      # Configure Git identity system-wide (same as --global for every user)
+      - name: Configure Git identity
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $userName = "${{ secrets.CODEBERG_USERNAME }}"
+          $userEmail = "${{ secrets.CODEBERG_EMAIL }}"
+          git config --system user.name "$userName"
+          git config --system user.email "$userEmail"
+          git config --system --list | Select-String "user\."
+          Write-Output "Git identity set to $userName <$userEmail>"
+
+      # Install s5cmd (fast parallel S3 client) system-wide
+      - name: Install s5cmd
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dir = "C:\ProgramData\s5cmd"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $env:RUNNER_TEMP "s5cmd.zip"
+          $url = "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Windows-64bit.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($machinePath -notlike "*$dir*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$dir", "Machine")
+          }
+          & "$dir\s5cmd.exe" version
+
+      # Register a Windows Scheduled Task that watches the Data folder and syncs changes to S3 within seconds
+      - name: Register S3 watcher scheduled task
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $taskDir = "C:\ProgramData\ghvm"
+          New-Item -ItemType Directory -Force -Path $taskDir | Out-Null
+          $scriptPath = Join-Path $taskDir "sync-data.ps1"
+          $scriptLines = @(
+              '$ErrorActionPreference = "Continue"'
+              '$log = "C:\ProgramData\ghvm\sync.log"'
+              '$s5cmd = "C:\ProgramData\s5cmd\s5cmd.exe"'
+              '$endpoint = "${{ secrets.S3_ENDPOINT }}"'
+              '$bucket = "${{ secrets.S3_BUCKET }}"'
+              '$env:AWS_ACCESS_KEY_ID = "${{ secrets.S3_ACCESS_KEY_ID }}"'
+              '$env:AWS_SECRET_ACCESS_KEY = "${{ secrets.S3_SECRET_ACCESS_KEY }}"'
+              '$env:AWS_REGION = "${{ secrets.S3_REGION }}"'
+              '$env:AWS_DEFAULT_REGION = "${{ secrets.S3_REGION }}"'
+              '$src = $null'
+              '$marker = $null'
+              '$watcher = $null'
+              'function Resolve-Profile {'
+              '    $sid = (Get-LocalUser -Name "Rohit" -ErrorAction SilentlyContinue).SID.Value'
+              '    $p = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $sid -and $_.SID -eq $sid } | Sort-Object LastUseTime -Descending | Select-Object -First 1).LocalPath'
+              '    if (-not $p) { $p = (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Rohit*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName }'
+              '    return $p'
+              '}'
+              'function Do-Sync {'
+              '    if (-not $src) { return }'
+              '    if (-not (Test-Path -LiteralPath $src)) { return }'
+              '    $localCount = @(Get-ChildItem -LiteralPath $src -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch ''[\\/]node_modules[\\/]'' }).Count'
+              '    if ($localCount -eq 0) {'
+              '        $remote = & $s5cmd --endpoint-url $endpoint ls "s3://$bucket/Data/" 2>$null'
+              '        if ($remote) {'
+              '            Add-Content -Path $log -Value ("{0} skip sync: local folder empty, remote has data" -f (Get-Date -Format o))'
+              '            return'
+              '        }'
+              '    }'
+              '    & $s5cmd --endpoint-url $endpoint --numworkers 64 sync --delete --exclude "*/node_modules/*" "$src\" "s3://$bucket/Data/" *>> $log'
+              '}'
+              'function Initialize-Restore {'
+              '    if (-not (Test-Path -LiteralPath $src)) { New-Item -ItemType Directory -Force -Path $src | Out-Null }'
+              '    if (-not (Test-Path -LiteralPath $marker)) {'
+              '        $remote = & $s5cmd --endpoint-url $endpoint ls "s3://$bucket/Data/" 2>$null'
+              '        if ($remote) {'
+              '            & $s5cmd --endpoint-url $endpoint --numworkers 64 sync --exclude "*/node_modules/*" "s3://$bucket/Data/*" "$src\" *>> $log'
+              '            if ($LASTEXITCODE -ne 0) { return $false }'
+              '        }'
+              '        New-Item -ItemType File -Force -Path $marker | Out-Null'
+              '    }'
+              '    return $true'
+              '}'
+              '$lastSync = Get-Date'
+              '$lastEvent = Get-Date'
+              '$pending = $false'
+              'while ($true) {'
+              '    if (-not $src) {'
+              '        $profile = Resolve-Profile'
+              '        if (-not $profile) { Start-Sleep -Seconds 10; continue }'
+              '        $src = Join-Path $profile "Desktop\Data"'
+              '        $marker = Join-Path $profile ".ghvm_restored"'
+              '        if (-not (Initialize-Restore)) { Start-Sleep -Seconds 30; continue }'
+              '        Do-Sync'
+              '        $lastSync = Get-Date'
+              '        try {'
+              '            if ($watcher) { $watcher.Dispose() }'
+              '            $watcher = New-Object IO.FileSystemWatcher $src, "*"'
+              '            $watcher.IncludeSubdirectories = $true'
+              '            $watcher.NotifyFilter = [IO.NotifyFilters]::FileName -bor [IO.NotifyFilters]::DirectoryName -bor [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size'
+              '            $watcher.EnableRaisingEvents = $true'
+              '        } catch { $watcher = $null }'
+              '    }'
+              '    $changed = $false'
+              '    if ($watcher) {'
+              '        try {'
+              '            $r = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, 1000)'
+              '            if (-not $r.TimedOut) { $changed = $true }'
+              '        } catch { $watcher.Dispose(); $watcher = $null; $changed = $true }'
+              '    } else { Start-Sleep -Milliseconds 1000 }'
+              '    if ($changed) { $pending = $true; $lastEvent = Get-Date }'
+              '    if ($pending -and ((Get-Date) - $lastEvent).TotalSeconds -ge 5) {'
+              '        Do-Sync'
+              '        $pending = $false'
+              '        $lastSync = Get-Date'
+              '    }'
+              '    if (((Get-Date) - $lastSync).TotalMinutes -ge 5) {'
+              '        Do-Sync'
+              '        $lastSync = Get-Date'
+              '        $pending = $false'
+              '    }'
+              '    if ($src -and -not (Test-Path -LiteralPath $src)) {'
+              '        if ($watcher) { $watcher.Dispose(); $watcher = $null }'
+              '        if ($marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue }'
+              '        $src = $null'
+              '    }'
+              '}'
+          )
+          Set-Content -Path $scriptPath -Value $scriptLines -Encoding ascii
+          icacls $taskDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+          icacls $scriptPath /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+
+          $pwsh = "$env:ProgramFiles\PowerShell\7\pwsh.exe"
+          if (-not (Test-Path -LiteralPath $pwsh)) { $pwsh = "powershell.exe" }
+
+          $action = New-ScheduledTaskAction -Execute $pwsh -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
+          $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10)
+          $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+              -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
+              -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
+          Register-ScheduledTask -TaskName "GhvmS3Sync" -Action $action -Trigger $trigger `
+              -Principal $principal -Settings $settings -Force | Out-Null
+          Start-ScheduledTask -TaskName "GhvmS3Sync"
+          Write-Output "Registered and started scheduled task GhvmS3Sync"
 
       # Step 3: Download Pinggy CLI
       - name: Download Pinggy CLI
@@ -84,6 +243,7 @@ jobs:
         timeout-minutes: 350
         continue-on-error: true
         run: |
+          # S3 mirroring runs independently in scheduled task GhvmS3Sync
           $pinggy = "$env:USERPROFILE\pinggy.exe"
           while ($true) {
               & $pinggy -p 443 -R0:127.0.0.1:3389 `
@@ -93,10 +253,36 @@ jobs:
               Start-Sleep -Seconds 10
           }
 
-      # Step 5: Save Data folder cache
-      - name: Save Data folder cache
-        uses: actions/cache@v4
+      # Upload Data folder to S3-compatible storage (iDrive e2) with s5cmd
+      - name: Upload Data to S3
+        shell: pwsh
         continue-on-error: true
-        with:
-          path: C:\Users\Rohit\Desktop\Data
-          key: ${{ runner.os }}-runner-desktop-data-${{ github.run_number }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.S3_REGION }}
+          AWS_DEFAULT_REGION: ${{ secrets.S3_REGION }}
+        run: |
+          $sid = (Get-LocalUser -Name "Rohit" -ErrorAction SilentlyContinue).SID.Value
+          $profile = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $sid -and $_.SID -eq $sid } | Sort-Object LastUseTime -Descending | Select-Object -First 1).LocalPath
+          if (-not $profile) {
+            $profile = (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "Rohit*" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+          }
+          if (-not $profile) {
+            Write-Output "Could not resolve Rohit profile, skipping upload"
+            exit 0
+          }
+          $src = Join-Path $profile "Desktop\Data"
+          if (-not (Test-Path -LiteralPath $src)) {
+            Write-Output "No Data folder at $src, skipping upload"
+            exit 0
+          }
+          Stop-ScheduledTask -TaskName "GhvmS3Sync" -ErrorAction SilentlyContinue
+          Unregister-ScheduledTask -TaskName "GhvmS3Sync" -Confirm:$false -ErrorAction SilentlyContinue
+          $s5cmd = "C:\ProgramData\s5cmd\s5cmd.exe"
+          & $s5cmd --endpoint-url "${{ secrets.S3_ENDPOINT }}" --numworkers 64 `
+              sync --delete --exclude "*/node_modules/*" "$src\" "s3://${{ secrets.S3_BUCKET }}/Data/"
+          if ($LASTEXITCODE -ne 0) {
+            throw "s5cmd upload failed with exit code $LASTEXITCODE"
+          }
+          Write-Output "Uploaded $src to s3://${{ secrets.S3_BUCKET }}/Data/"
