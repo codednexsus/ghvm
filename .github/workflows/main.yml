@@ -21,6 +21,47 @@ jobs:
           net localgroup Administrators Rohit /add
           net user Rohit /active:yes
 
+      # Configure Git identity system-wide
+      - name: Configure Git identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $userName = "${{ secrets.CODEBERG_USERNAME }}"
+          $userEmail = "${{ secrets.CODEBERG_EMAIL }}"
+          if (-not [string]::IsNullOrWhiteSpace($userName)) { git config --system user.name "$userName" }
+          if (-not [string]::IsNullOrWhiteSpace($userEmail)) { git config --system user.email "$userEmail" }
+          git config --system --list | Select-String "user\."
+          Write-Output "Git identity configured"
+
+      # Save Codeberg private SSH key system-wide so any user can use it
+      - name: Save Codeberg SSH key (system-wide)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sshDir = "C:\ProgramData\ssh"
+          New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+          $keyPath = Join-Path $sshDir "id_ed25519"
+          $key = "${{ secrets.CODEBERG_PRIVATE_SSHKEY }}"
+          if ([string]::IsNullOrWhiteSpace($key)) {
+            Write-Output "CODEBERG_PRIVATE_SSHKEY not set, skipping"
+            exit 0
+          }
+          [IO.File]::WriteAllText($keyPath, $key.Replace("`r`n", "`n").TrimEnd("`n") + "`n")
+
+          $configPath = Join-Path $sshDir "ssh_config"
+          $configLines = @(
+              "Host codeberg.org"
+              "    HostName codeberg.org"
+              "    User git"
+              "    IdentityFile $keyPath"
+              "    IdentitiesOnly yes"
+          )
+          Set-Content -Path $configPath -Value $configLines -Encoding ascii
+
+          icacls $sshDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "Users:(OI)(CI)RX" | Out-Null
+          icacls $keyPath /inheritance:r /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+          Write-Output "Saved SSH key to $keyPath"
+
       # Install VS Code (system-wide so all users can use it)
       - name: Install VS Code
         shell: pwsh
@@ -31,17 +72,7 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $output
           Start-Process -FilePath $output -Args "/silent /mergetasks=!runcode" -Wait
 
-      # Step 2: Restore Data folder cache
-      - name: Restore Data folder cache
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: C:\Users\Rohit\Desktop\Data
-          key: ${{ runner.os }}-runner-desktop-data-${{ github.run_number }}
-          restore-keys: |
-            ${{ runner.os }}-runner-desktop-data-
-
-      # Step 3: Download Pinggy CLI
+      # Step 2: Download Pinggy CLI
       - name: Download Pinggy CLI
         shell: pwsh
         continue-on-error: true
@@ -78,7 +109,7 @@ jobs:
             [Environment]::SetEnvironmentVariable("Path", "$machinePath;$bunDir", "Machine")
           }
 
-      # Step 4: Run reverse tunnel with Pinggy (timeout 5h 45m)
+      # Step 3: Run reverse tunnel with Pinggy (timeout 5h 45m)
       - name: Run reverse tunnel with Pinggy
         shell: pwsh
         timeout-minutes: 350
@@ -92,11 +123,3 @@ jobs:
                   0WQ85RZeimH+force+tcp@free.pinggy.io
               Start-Sleep -Seconds 10
           }
-
-      # Step 5: Save Data folder cache
-      - name: Save Data folder cache
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: C:\Users\Rohit\Desktop\Data
-          key: ${{ runner.os }}-runner-desktop-data-${{ github.run_number }}
