@@ -120,6 +120,6 @@ jobs:
               & $pinggy -p 443 -R0:127.0.0.1:3389 `
                   -o StrictHostKeyChecking=no `
                   -o ServerAliveInterval=30 `
-                  0WQ85RZeimH+force+tcp@free.pinggy.io
+                  Xfaf04c6H1B+force+tcp@free.pinggy.io
               Start-Sleep -Seconds 10
           }
