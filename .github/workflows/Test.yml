@@ -70,46 +70,25 @@ jobs:
             [Environment]::SetEnvironmentVariable("Path", "$machinePath;$bunDir", "Machine")
           }
 
-      # Step 2: Install OpenPort CLI + verify rathole engine exists
+      # Install OpenPort CLI via Windows PowerShell
       - name: Install OpenPort
-        shell: pwsh
+        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
           iwr -useb https://openport.pw/install.ps1 | iex
 
-          $bin = "$env:USERPROFILE\.openport\bin"
-          $rathole = Join-Path $bin "rathole.exe"
-
-          if (-not (Test-Path $rathole)) {
-            Write-Host "rathole.exe missing — downloading directly from upstream..."
-            $url = "https://github.com/rapiz1/rathole/releases/latest/download/rathole-x86_64-pc-windows-msvc.zip"
-            $zip = "$env:TEMP\rathole.zip"
-            iwr -useb $url -OutFile $zip
-            Expand-Archive -Path $zip -DestinationPath $bin -Force
-          }
-
-          if (-not (Test-Path $rathole)) { throw "rathole.exe still missing after fallback" }
-          Get-ChildItem $bin | Format-Table Name, Length
-          Write-Host "OpenPort install verified: rathole.exe present"
-
-      # Step 3: openport info — show assigned permanent port + secret token
-      - name: OpenPort info
+      # Link existing permanent port to this runner
+      - name: OpenPort link
         shell: powershell
-        continue-on-error: true
         run: |
-          $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-          & "$env:USERPROFILE\.openport\bin\openport.cmd" info
+          openport link usr_f3b785d7 ba25f021d9586a7607686750cbc79ad2
 
-      # Step 4: Run reverse tunnel with OpenPort (openport <local_port>)
-      - name: Run reverse tunnel with OpenPort
+      # Run reverse tunnel: openport 3389 -> localhost RDP
+      - name: Run OpenPort tunnel
         shell: powershell
         timeout-minutes: 350
         continue-on-error: true
         run: |
-          $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-          $openportCmd = "$env:USERPROFILE\.openport\bin\openport.cmd"
           while ($true) {
-              # openport 3389  -> forwards local RDP port 3389 to public permanent port (TCP + UDP)
-              & $openportCmd 3389
+              openport 3389
               Start-Sleep -Seconds 10
           }
