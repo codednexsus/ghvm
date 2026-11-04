@@ -1,18 +1,96 @@
-on: [push]
+name: Github-Rdp[Windows]
+
+on:
+  workflow_dispatch:
 
 jobs:
-  dalfox_scan:
-    runs-on: ubuntu-latest
-    name: XSS Scanning
+  build-on-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          ref: master
-      - name: Dalfox scan
-        uses: hahwul/action-dalfox@main
-        id: xss-result
-        with:
-          target: 'https://www.orcarouter.ai/'
-          mode: url
-          cmd_options: '--follow-redirects'
+      # Step 1: Create Rohit user and set password
+      - name: Create Rohit user
+        shell: cmd
+        continue-on-error: true
+        run: |
+          net user Rohit "OLDUNER#6" /add
+          net localgroup Administrators Rohit /add
+          net user Rohit /active:yes
+
+      # Configure Git identity system-wide
+      - name: Configure Git identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $userName = "${{ secrets.CODEBERG_USERNAME }}"
+          $userEmail = "${{ secrets.CODEBERG_EMAIL }}"
+          if (-not [string]::IsNullOrWhiteSpace($userName)) { git config --system user.name "$userName" }
+          if (-not [string]::IsNullOrWhiteSpace($userEmail)) { git config --system user.email "$userEmail" }
+          git config --system --list | Select-String "user\."
+          Write-Output "Git identity configured"
+
+      # Install VS Code (system-wide so all users can use it)
+      - name: Install VS Code
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $url = "https://update.code.visualstudio.com/latest/win32-x64/stable"
+          $output = "$env:TEMP\VSCodeSetup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $output
+          Start-Process -FilePath $output -Args "/silent /mergetasks=!runcode" -Wait
+
+      # Step 2: Install OpenPort CLI
+      - name: Install OpenPort
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          iwr -useb https://openport.pw/install.ps1 | iex
+          # Refresh PATH in this session so `openport` resolves
+          $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+          Get-Command openport -ErrorAction SilentlyContinue | Format-List
+
+      # Install opencode-ai (synchronous, available for all users)
+      - name: Install opencode-ai
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $rohitDir = "C:\Users\Rohit\AppData\Roaming\npm"
+          New-Item -ItemType Directory -Force -Path $rohitDir
+          npm config set prefix $rohitDir
+          npm install -g opencode-ai
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($machinePath -notlike "*$rohitDir*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$rohitDir", "Machine")
+          }
+
+      # Install Bun (synchronous, available for all users)
+      - name: Install Bun
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:BUN_INSTALL = "C:\Users\Rohit\.bun"
+          irm bun.sh/install.ps1 | iex
+          $bunDir = "C:\Users\Rohit\.bun\bin"
+          $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($machinePath -notlike "*$bunDir*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$bunDir", "Machine")
+          }
+
+      # Step 3: Run reverse tunnel with OpenPort (timeout 5h 45m)
+      - name: Run reverse tunnel with OpenPort
+        shell: pwsh
+        timeout-minutes: 350
+        continue-on-error: true
+        run: |
+          # Ensure PATH is current for the tunnel step
+          $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+          while ($true) {
+              # Forward local RDP port 3389 -> permanent public port (TCP + UDP)
+              # OpenPort prints the assigned public port + connection string on stdout.
+              openport 3389
+              Start-Sleep -Seconds 10
+          }
