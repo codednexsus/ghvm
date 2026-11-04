@@ -75,6 +75,23 @@ jobs:
         shell: powershell
         run: |
           iwr -useb https://openport.pw/install.ps1 | iex
+          # --- ADDED: export openport.exe folder to PATH for later steps ---
+          $candidates = @(
+            "$env:LOCALAPPDATA\openport\openport.exe",
+            "$env:LOCALAPPDATA\Programs\openport\openport.exe",
+            "$env:USERPROFILE\.openport\openport.exe",
+            "$env:USERPROFILE\.openport\bin\openport.exe",
+            "$env:ProgramFiles\OpenPort\openport.exe"
+          )
+          $bin = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bin) {
+            $bin = Get-ChildItem -Path $env:LOCALAPPDATA -Filter openport.exe -Recurse -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $bin) { throw "openport.exe not found after install" }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $bin)
+          Write-Output "openport at: $bin"
+          # --- END ADDED ---
 
       # Link existing permanent port to this runner
       - name: OpenPort link
