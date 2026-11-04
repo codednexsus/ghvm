@@ -70,42 +70,46 @@ jobs:
             [Environment]::SetEnvironmentVariable("Path", "$machinePath;$bunDir", "Machine")
           }
 
-      # Install OpenPort CLI via Windows PowerShell
+      # Step 2: Install OpenPort CLI + verify rathole engine exists
       - name: Install OpenPort
-        shell: powershell
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           iwr -useb https://openport.pw/install.ps1 | iex
-          # --- ADDED: export openport.exe folder to PATH for later steps ---
-          $candidates = @(
-            "$env:LOCALAPPDATA\openport\openport.exe",
-            "$env:LOCALAPPDATA\Programs\openport\openport.exe",
-            "$env:USERPROFILE\.openport\openport.exe",
-            "$env:USERPROFILE\.openport\bin\openport.exe",
-            "$env:ProgramFiles\OpenPort\openport.exe"
-          )
-          $bin = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $bin) {
-            $bin = Get-ChildItem -Path $env:LOCALAPPDATA -Filter openport.exe -Recurse -ErrorAction SilentlyContinue |
-                   Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $bin) { throw "openport.exe not found after install" }
-          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $bin)
-          Write-Output "openport at: $bin"
-          # --- END ADDED ---
 
-      # Link existing permanent port to this runner
+          $bin = "$env:USERPROFILE\.openport\bin"
+          $rathole = Join-Path $bin "rathole.exe"
+
+          if (-not (Test-Path $rathole)) {
+            Write-Host "rathole.exe missing — downloading directly from upstream..."
+            $url = "https://github.com/rapiz1/rathole/releases/latest/download/rathole-x86_64-pc-windows-msvc.zip"
+            $zip = "$env:TEMP\rathole.zip"
+            iwr -useb $url -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath $bin -Force
+          }
+
+          if (-not (Test-Path $rathole)) { throw "rathole.exe still missing after fallback" }
+          Get-ChildItem $bin | Format-Table Name, Length
+          Write-Host "OpenPort install verified: rathole.exe present"
+
+      # Step 3: Link existing permanent port to this runner
       - name: OpenPort link
         shell: powershell
         run: |
-          openport link usr_f3b785d7 ba25f021d9586a7607686750cbc79ad2
+          $openportCmd = "$env:USERPROFILE\.openport\bin\openport.cmd"
+          if (-not (Test-Path $openportCmd)) { throw "openport.cmd not found at $openportCmd" }
+          & $openportCmd link usr_f3b785d7 ba25f021d9586a7607686750cbc79ad2
 
-      # Run reverse tunnel: openport 3389 -> localhost RDP
-      - name: Run OpenPort tunnel
+      # Step 4: Run reverse tunnel with OpenPort (openport <local_port>)
+      - name: Run reverse tunnel with OpenPort
         shell: powershell
         timeout-minutes: 350
         continue-on-error: true
         run: |
+          $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+          $openportCmd = "$env:USERPROFILE\.openport\bin\openport.cmd"
           while ($true) {
-              openport 3389
+              # openport 3389  -> forwards local RDP port 3389 to public permanent port (TCP + UDP)
+              & $openportCmd 3389
               Start-Sleep -Seconds 10
           }
