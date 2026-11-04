@@ -92,13 +92,13 @@ jobs:
           Get-ChildItem $bin | Format-Table Name, Length
           Write-Host "OpenPort install verified: rathole.exe present"
 
-      # Step 3: Link existing permanent port to this runner
-      - name: OpenPort link
+      # Step 3: openport info — show assigned permanent port + secret token
+      - name: OpenPort info
         shell: powershell
+        continue-on-error: true
         run: |
-          $openportCmd = "$env:USERPROFILE\.openport\bin\openport.cmd"
-          if (-not (Test-Path $openportCmd)) { throw "openport.cmd not found at $openportCmd" }
-          & $openportCmd link usr_f3b785d7 ba25f021d9586a7607686750cbc79ad2
+          $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+          & "$env:USERPROFILE\.openport\bin\openport.cmd" info
 
       # Step 4: Run reverse tunnel with OpenPort (openport <local_port>)
       - name: Run reverse tunnel with OpenPort
